@@ -49,7 +49,7 @@ while true; do
     http_code=$(curl -s -o "$response_file" -w '%{http_code}' \\
       -X POST \\
       -H 'Content-Type: application/json' \\
-      -d "{\"vmName\":\"$VM_NAME\",\"token\":\"$TOKEN\"}" \\
+      -d '{"vmName":"${vmName}","token":"${token}"}' \\
       "$PUBLIC_URL/next-runner")
 
     if [ "$http_code" = "200" ]; then

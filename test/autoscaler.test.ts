@@ -79,6 +79,14 @@ test('buildUserData embeds version, JIT config, VM name, token, and public URL, 
   assert.ok(Buffer.byteLength(userData) < 32 * 1024);
 });
 
+test('buildUserData bakes a correctly quoted next-runner JSON payload', () => {
+  const token = 'a'.repeat(64);
+  const userData = buildUserData('2.335.1', 'YWJj', 'ci-runner-42', token, 'https://ci.example.com');
+  // Single-quoted JSON with literal double quotes — the bug where TS escapes
+  // ate the inner quotes produced {vmName:...} and the server replied 400.
+  assert.ok(userData.includes(`-d '{"vmName":"ci-runner-42","token":"${token}"}'`));
+});
+
 test('buildUserData rejects unsafe interpolations', () => {
   const validToken = 'a'.repeat(64);
   assert.throws(() => buildUserData('2.335.1; rm -rf /', 'YWJj', 'ci-runner-1', validToken, 'https://example.com'));
