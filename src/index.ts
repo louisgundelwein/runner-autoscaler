@@ -6,7 +6,9 @@ import {
   labelsMatch,
   latestRunnerVersion,
   listQueuedJobs,
+  openFailureIssueOnce,
   serverNameForJob,
+  setFailureStatus,
   verifySignature,
 } from './github.ts';
 import {
@@ -23,6 +25,33 @@ const config = loadConfig();
 // Jobs currently being provisioned in this process; first line of dedup.
 // Across restarts, Hetzner's per-project name uniqueness is the guarantee.
 const inFlight = new Set<number>();
+
+// Consecutive provisioning failures per repo; at the threshold an issue is
+// opened on the repo (deduped there via label). Reset on the next success.
+const failureCounts = new Map<string, number>();
+const OPEN_ISSUE_AFTER = 3;
+
+async function reportProvisioningFailure(
+  repo: string,
+  jobId: number,
+  headSha: string | undefined,
+  err: unknown,
+): Promise<void> {
+  const message = String(err);
+  const count = (failureCounts.get(repo) ?? 0) + 1;
+  failureCounts.set(repo, count);
+  log('error', 'provisioning failed', { jobId, repo, consecutiveFailures: count, error: message });
+  if (headSha) {
+    await setFailureStatus(config, repo, headSha, message).catch((e) =>
+      log('error', 'could not set commit status (PAT permission "Commit statuses: RW"?)', { error: String(e) }),
+    );
+  }
+  if (count >= OPEN_ISSUE_AFTER) {
+    await openFailureIssueOnce(config, repo, message).catch((e) =>
+      log('error', 'could not open failure issue (PAT permission "Issues: RW"?)', { error: String(e) }),
+    );
+  }
+}
 
 async function provisionRunner(repo: string, jobId: number): Promise<void> {
   if (inFlight.has(jobId)) return;
@@ -47,6 +76,7 @@ async function provisionRunner(repo: string, jobId: number): Promise<void> {
       generateJitConfig(config, repo, name),
     ]);
     const result = await createRunnerServer(config, name, repo, buildUserData(version, jitConfig));
+    failureCounts.set(repo, 0);
     log('info', result === 'created' ? 'runner VM created' : 'runner VM already existed', {
       jobId,
       repo,
@@ -60,7 +90,7 @@ async function provisionRunner(repo: string, jobId: number): Promise<void> {
 
 type WorkflowJobEvent = {
   action: string;
-  workflow_job?: { id: number; labels: string[] };
+  workflow_job?: { id: number; labels: string[]; head_sha?: string };
   repository?: { full_name: string };
 };
 
@@ -76,7 +106,7 @@ function handleWorkflowJobEvent(payload: WorkflowJobEvent): void {
     }
     if (!labelsMatch(job.labels, config.runnerLabels)) return;
     provisionRunner(repo, job.id).catch((err) =>
-      log('error', 'provisioning failed', { jobId: job.id, repo, error: String(err) }),
+      reportProvisioningFailure(repo, job.id, job.head_sha, err),
     );
   } else if (payload.action === 'completed') {
     deleteServerByName(config, serverNameForJob(job.id)).catch((err) =>
@@ -107,7 +137,7 @@ async function cleanupTick(): Promise<void> {
     for (const job of jobs) {
       if (labelsMatch(job.labels, config.runnerLabels)) {
         await provisionRunner(repo, job.id).catch((err) =>
-          log('error', 'reconcile provisioning failed', { jobId: job.id, repo, error: String(err) }),
+          reportProvisioningFailure(repo, job.id, job.head_sha, err),
         );
       }
     }

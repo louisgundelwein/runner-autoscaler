@@ -48,6 +48,11 @@ Create a [fine-grained personal access token](https://github.com/settings/person
 - **Repository permissions**:
   - **Administration: Read and write** (JIT runner registration)
   - **Actions: Read** (reconcile pass for queued jobs)
+  - **Commit statuses: Read and write** (error status on the PR when provisioning fails)
+  - **Issues: Read and write** (escalation issue after repeated provisioning failures)
+
+The last two are optional — without them failures are only visible in the
+service logs (the autoscaler logs the 403 and carries on).
 
 ### 2. Hetzner Cloud token
 
@@ -143,10 +148,12 @@ npm run dev       # run locally with .env
 
 ## Troubleshooting
 
-- **Job stays queued, no VM appears** — check webhook deliveries (repo →
-  Settings → Webhooks → Recent Deliveries): 401 means wrong secret, timeout
-  means the service is down. The reconcile sweep provisions missed jobs within
-  `CLEANUP_INTERVAL_MINUTES` on its own.
+- **Job stays queued, no VM appears** — provisioning failures show up as a red
+  `runner-autoscaler` commit status on the PR (and after 3 consecutive
+  failures as an auto-opened issue labeled `runner-autoscaler`). Also check
+  webhook deliveries (repo → Settings → Webhooks → Recent Deliveries): 401
+  means wrong secret, timeout means the service is down. The reconcile sweep
+  provisions missed jobs within `CLEANUP_INTERVAL_MINUTES` on its own.
 - **Job stays queued, VM exists** — boot/install takes ~2–5 min. If it never
   starts, create the VM with `HETZNER_SSH_KEY` set and inspect
   `/var/log/cloud-init-output.log` on the VM.

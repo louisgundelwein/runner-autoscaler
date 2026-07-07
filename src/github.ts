@@ -26,7 +26,7 @@ export function serverNameForJob(jobId: number): string {
   return `ci-runner-${jobId}`;
 }
 
-async function githubRequest(token: string, method: string, path: string): Promise<unknown> {
+async function githubRequest(token: string, method: string, path: string, body?: unknown): Promise<unknown> {
   const res = await fetch(`${API}${path}`, {
     method,
     headers: {
@@ -34,10 +34,54 @@ async function githubRequest(token: string, method: string, path: string): Promi
       accept: 'application/vnd.github+json',
       'x-github-api-version': '2022-11-28',
       'user-agent': 'runner-autoscaler',
+      ...(body ? { 'content-type': 'application/json' } : {}),
     },
+    body: body ? JSON.stringify(body) : undefined,
   });
   if (!res.ok) throw new Error(`GitHub API ${method} ${path} failed: ${res.status} ${res.statusText}`);
   return res.json();
+}
+
+const STATUS_CONTEXT = 'runner-autoscaler';
+
+/**
+ * Surface a provisioning failure directly on the commit/PR as an error
+ * status — otherwise the job just sits "queued" with no visible reason.
+ * Requires PAT permission "Commit statuses: read & write".
+ */
+export async function setFailureStatus(config: Config, repo: string, sha: string, message: string): Promise<void> {
+  await githubRequest(config.githubToken, 'POST', `/repos/${repo}/statuses/${sha}`, {
+    state: 'error',
+    context: STATUS_CONTEXT,
+    description: message.slice(0, 140),
+  });
+}
+
+/**
+ * Escalation: open one issue when provisioning keeps failing. Deduped via
+ * the runner-autoscaler label — while such an issue is open, no new one is
+ * created. Requires PAT permission "Issues: read & write".
+ */
+export async function openFailureIssueOnce(config: Config, repo: string, message: string): Promise<void> {
+  const open = (await githubRequest(
+    config.githubToken,
+    'GET',
+    `/repos/${repo}/issues?state=open&labels=${STATUS_CONTEXT}&per_page=1`,
+  )) as unknown[];
+  if (open.length > 0) return;
+  await githubRequest(config.githubToken, 'POST', `/repos/${repo}/issues`, {
+    title: 'runner-autoscaler: provisioning is failing repeatedly',
+    labels: [STATUS_CONTEXT],
+    body: [
+      'The runner autoscaler failed to provision ephemeral runners several times in a row.',
+      '',
+      `Last error: \`${message.slice(0, 500)}\``,
+      '',
+      'Jobs targeting `[self-hosted, hetzner]` will stay queued until this is fixed.',
+      'Check the autoscaler service logs for details. This issue was opened automatically;',
+      'close it once provisioning works again.',
+    ].join('\n'),
+  });
 }
 
 /**
@@ -119,7 +163,7 @@ export async function latestRunnerVersion(): Promise<string> {
   return version;
 }
 
-export type QueuedJob = { id: number; labels: string[] };
+export type QueuedJob = { id: number; labels: string[]; head_sha: string };
 
 /**
  * List queued workflow jobs for a repo. Used by the reconcile pass to heal
@@ -140,9 +184,9 @@ export async function listQueuedJobs(config: Config, repo: string): Promise<Queu
       config.githubToken,
       'GET',
       `/repos/${repo}/actions/runs/${run.id}/jobs?per_page=100`,
-    )) as { jobs: Array<{ id: number; status: string; labels: string[] }> };
+    )) as { jobs: Array<{ id: number; status: string; labels: string[]; head_sha: string }> };
     for (const job of runJobs.jobs) {
-      if (job.status === 'queued') jobs.push({ id: job.id, labels: job.labels });
+      if (job.status === 'queued') jobs.push({ id: job.id, labels: job.labels, head_sha: job.head_sha });
     }
   }
   return jobs;
