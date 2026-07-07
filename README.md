@@ -96,8 +96,8 @@ jobs:
       - run: echo "running on an ephemeral Hetzner VM"
 ```
 
-First run: expect ~2–5 min of queue time (VM boot, apt + runner install) while the VM boots and the runner
-installs, then the job starts.
+First run: expect ~2–5 min of queue time while the VM boots and the runner
+installs (apt update + .NET dependencies take most of it), then the job starts.
 
 ### Adding another repository later
 
