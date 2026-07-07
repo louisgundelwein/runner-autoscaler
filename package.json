@@ -1,0 +1,20 @@
+{
+  "name": "runner-autoscaler",
+  "version": "1.0.0",
+  "description": "Ephemeral GitHub Actions runner autoscaler for Hetzner Cloud — one throwaway VM per CI job",
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": ">=22.6"
+  },
+  "scripts": {
+    "build": "tsc",
+    "test": "node --experimental-strip-types --test test/autoscaler.test.ts",
+    "dev": "node --experimental-strip-types --env-file=.env src/index.ts",
+    "start": "node dist/index.js"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "typescript": "^5.9.0"
+  }
+}
