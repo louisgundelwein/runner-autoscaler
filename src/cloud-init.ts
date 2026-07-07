@@ -89,9 +89,10 @@ packages:
   - git
   - curl
 write_files:
+  # No owner: attribute — write_files runs BEFORE the users module creates
+  # the runner user (getpwnam fails); the chown -R in runcmd fixes ownership.
   - path: /home/runner/agent-loop.sh
     permissions: '0755'
-    owner: runner:runner
     content: |
 ${agentLoop.split('\n').map((line) => '      ' + line).join('\n')}
 runcmd:
