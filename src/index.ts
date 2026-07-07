@@ -82,7 +82,7 @@ async function provisionRunner(repo: string, jobId: number): Promise<void> {
     // Check if any online, non-busy runner with our labels already exists.
     const allRunners = await listRunners(config, repo);
     const availableRunner = allRunners.find(
-      (r) => r.status === 'online' && !r.busy && config.runnerLabels.every((l) => r.name.includes(l) || true),
+      (r) => r.status === 'online' && !r.busy && config.runnerLabels.every((l) => r.labels.includes(l)),
     );
     if (availableRunner) {
       log('info', 'runner already online and available, GitHub will assign', {

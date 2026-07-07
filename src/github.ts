@@ -176,7 +176,7 @@ export async function latestRunnerVersion(): Promise<string> {
 }
 
 export type QueuedJob = { id: number; labels: string[]; head_sha: string };
-export type Runner = { id: number; name: string; status: string; busy: boolean };
+export type Runner = { id: number; name: string; status: string; busy: boolean; labels: string[] };
 
 /** Check if a VM should drain (no longer accept new jobs). */
 export function shouldDrain(aliveMinutes: number, hasQueuedJobs: boolean): boolean {
@@ -216,8 +216,14 @@ export async function listRunners(config: Config, repo: string): Promise<Runner[
     config.githubToken,
     'GET',
     `/repos/${repo}/actions/runners?per_page=100`,
-  )) as { runners: Array<{ id: number; name: string; status: string; busy: boolean }> };
-  return runners.runners.map((r) => ({ id: r.id, name: r.name, status: r.status, busy: r.busy }));
+  )) as { runners: Array<{ id: number; name: string; status: string; busy: boolean; labels: Array<{ name: string }> }> };
+  return runners.runners.map((r) => ({
+    id: r.id,
+    name: r.name,
+    status: r.status,
+    busy: r.busy,
+    labels: r.labels.map((l) => l.name),
+  }));
 }
 
 /** Delete a runner by ID. Returns the HTTP status (204 expected; 404 treated as success). */
