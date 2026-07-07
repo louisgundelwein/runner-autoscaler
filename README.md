@@ -65,6 +65,10 @@ Security: VM agent uses a per-VM token (HMAC of vmName + webhook secret) to auth
   builds (e.g., full turbo Next.js builds) can exceed physical RAM. Cloud-init allocates
   8 GB swap to prevent OOM kills, allowing builds to spill to disk safely.
 
+- **Docker support for image builds.** Docker.io is installed on each VM, and the runner
+  user is added to the docker group, enabling runners to build and push images to a registry.
+  Installation adds ~30 seconds to first-boot setup time.
+
 - **Zero runtime dependencies.** Plain Node 22 (`node:http`, `node:crypto`, `fetch`).
   The production image contains only the compiled `dist/`.
 
@@ -130,7 +134,8 @@ jobs:
 ```
 
 First run: expect ~2–5 min of queue time while the VM boots and the runner
-installs (apt update + .NET dependencies take most of it), then the job starts.
+installs (apt update + .NET dependencies + Docker installation take most of it), then the job starts.
+Subsequent jobs on the same VM start immediately.
 
 ### Adding another repository later
 

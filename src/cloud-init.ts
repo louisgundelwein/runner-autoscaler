@@ -88,6 +88,7 @@ package_update: true
 packages:
   - git
   - curl
+  - docker.io
 write_files:
   # No owner: attribute — write_files runs BEFORE the users module creates
   # the runner user (getpwnam fails); the chown -R in runcmd fixes ownership.
@@ -101,6 +102,7 @@ runcmd:
   - curl -fsSL https://github.com/actions/runner/releases/download/v${runnerVersion}/actions-runner-linux-x64-${runnerVersion}.tar.gz | tar xz -C /home/runner/actions-runner
   - /home/runner/actions-runner/bin/installdependencies.sh
   - chown -R runner:runner /home/runner
+  - usermod -aG docker runner
   - sudo -u runner /home/runner/agent-loop.sh
 `;
   if (Buffer.byteLength(userData) > MAX_USER_DATA_BYTES) {
