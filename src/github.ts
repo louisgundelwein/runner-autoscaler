@@ -45,8 +45,25 @@ async function githubRequest(token: string, method: string, path: string): Promi
  * with it is inherently ephemeral: it runs at most one job and is removed
  * from the repo by GitHub afterwards. No GitHub credential ever reaches the
  * VM — only this opaque, single-use config blob does.
+ *
+ * Generating the config already registers the runner name on GitHub's side.
+ * If a previous attempt registered the name but the VM was never created
+ * (e.g. the Hetzner call failed), the retry gets a 409 Conflict — in that
+ * case we delete the orphaned offline runner and try once more.
  */
 export async function generateJitConfig(config: Config, repo: string, runnerName: string): Promise<string> {
+  const first = await requestJitConfig(config, repo, runnerName);
+  if (first.status !== 409) return unwrapJitConfig(first, repo);
+
+  await deleteOfflineRunnerByName(config, repo, runnerName);
+  return unwrapJitConfig(await requestJitConfig(config, repo, runnerName), repo);
+}
+
+async function requestJitConfig(
+  config: Config,
+  repo: string,
+  runnerName: string,
+): Promise<{ status: number; data: any }> {
   const res = await fetch(`${API}/repos/${repo}/actions/runners/generate-jitconfig`, {
     method: 'POST',
     headers: {
@@ -58,9 +75,33 @@ export async function generateJitConfig(config: Config, repo: string, runnerName
     },
     body: JSON.stringify({ name: runnerName, runner_group_id: 1, labels: config.runnerLabels }),
   });
-  if (!res.ok) throw new Error(`generate-jitconfig for ${repo} failed: ${res.status} ${res.statusText}`);
-  const data = (await res.json()) as { encoded_jit_config: string };
-  return data.encoded_jit_config;
+  return { status: res.status, data: res.ok ? await res.json() : null };
+}
+
+function unwrapJitConfig(res: { status: number; data: any }, repo: string): string {
+  if (!res.data?.encoded_jit_config) throw new Error(`generate-jitconfig for ${repo} failed: ${res.status}`);
+  return res.data.encoded_jit_config;
+}
+
+/** Remove a runner registration that never came online (safety: never deletes online runners). */
+async function deleteOfflineRunnerByName(config: Config, repo: string, runnerName: string): Promise<void> {
+  const runners = (await githubRequest(
+    config.githubToken,
+    'GET',
+    `/repos/${repo}/actions/runners?per_page=100`,
+  )) as { runners: Array<{ id: number; name: string; status: string }> };
+  const orphan = runners.runners.find((r) => r.name === runnerName && r.status === 'offline');
+  if (!orphan) return;
+  const res = await fetch(`${API}/repos/${repo}/actions/runners/${orphan.id}`, {
+    method: 'DELETE',
+    headers: {
+      authorization: `Bearer ${config.githubToken}`,
+      accept: 'application/vnd.github+json',
+      'x-github-api-version': '2022-11-28',
+      'user-agent': 'runner-autoscaler',
+    },
+  });
+  if (res.status !== 204) throw new Error(`Deleting orphaned runner ${runnerName} failed: ${res.status}`);
 }
 
 let cachedRunnerVersion: { version: string; fetchedAt: number } | null = null;
