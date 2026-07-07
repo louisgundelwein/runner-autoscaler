@@ -4,6 +4,7 @@ import { loadConfig } from './config.ts';
 import { log } from './log.ts';
 import {
   generateJitConfig,
+  getJobStatus,
   labelsMatch,
   latestRunnerVersion,
   listQueuedJobs,
@@ -62,10 +63,21 @@ async function reportProvisioningFailure(
   }
 }
 
-async function provisionRunner(repo: string, jobId: number): Promise<void> {
+async function provisionRunner(repo: string, jobId: number, recheck = false): Promise<void> {
   if (inFlight.has(jobId)) return;
   inFlight.add(jobId);
   try {
+    if (recheck) {
+      // The queued webhook races GitHub's own assignment to an idle reused
+      // runner: by the time we see the event, the job may already be running
+      // there. Wait briefly and re-check before paying for a VM.
+      await new Promise((r) => setTimeout(r, 10_000));
+      const status = await getJobStatus(config, repo, jobId).catch(() => 'queued');
+      if (status !== 'queued') {
+        log('info', 'job already picked up, skipping provisioning', { jobId, repo, status });
+        return;
+      }
+    }
     const servers = await listRunnerServers(config);
     // ponytail: cap check is approximate under concurrency — Hetzner name
     // uniqueness prevents duplicates, and the reconcile pass picks up jobs
@@ -136,7 +148,7 @@ function handleWorkflowJobEvent(payload: WorkflowJobEvent): void {
       return;
     }
     if (!labelsMatch(job.labels, config.runnerLabels)) return;
-    provisionRunner(repo, job.id).catch((err) =>
+    provisionRunner(repo, job.id, true).catch((err) =>
       reportProvisioningFailure(repo, job.id, job.head_sha, err),
     );
   }

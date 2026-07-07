@@ -175,6 +175,14 @@ export async function latestRunnerVersion(): Promise<string> {
   return version;
 }
 
+/** Current status of a single workflow job (queued/in_progress/completed). */
+export async function getJobStatus(config: Config, repo: string, jobId: number): Promise<string> {
+  const job = (await githubRequest(config.githubToken, 'GET', `/repos/${repo}/actions/jobs/${jobId}`)) as {
+    status: string;
+  };
+  return job.status;
+}
+
 export type QueuedJob = { id: number; labels: string[]; head_sha: string };
 export type Runner = { id: number; name: string; status: string; busy: boolean; labels: string[] };
 
