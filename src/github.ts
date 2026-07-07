@@ -178,9 +178,16 @@ export async function latestRunnerVersion(): Promise<string> {
 export type QueuedJob = { id: number; labels: string[]; head_sha: string };
 export type Runner = { id: number; name: string; status: string; busy: boolean; labels: string[] };
 
-/** Check if a VM should drain (no longer accept new jobs). */
+/**
+ * Check if a VM should drain (no longer accept new jobs). Only in the last
+ * ~10 minutes of each billed hour AND with nothing queued — mid-hour the VM
+ * always keeps an idle runner listening, because that idle time is already
+ * paid for and makes the next job start instantly (this IS the reuse).
+ * With jobs queued we keep serving even past minute 50: continuing into the
+ * next hour costs the same as booting a replacement VM, minus the latency.
+ */
 export function shouldDrain(aliveMinutes: number, hasQueuedJobs: boolean): boolean {
-  return aliveMinutes % 60 >= 50 || !hasQueuedJobs;
+  return aliveMinutes % 60 >= 50 && !hasQueuedJobs;
 }
 
 /**

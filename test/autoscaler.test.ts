@@ -107,14 +107,17 @@ test('vmToken computes HMAC-SHA256 and verifyVmToken validates it', () => {
   assert.ok(!verifyVmToken('different-secret', vmName, token));
 });
 
-test('shouldDrain returns true in drain window (minute 50+) or no queued jobs', () => {
-  assert.equal(shouldDrain(10, true), false);
-  assert.equal(shouldDrain(49, true), false);
-  assert.equal(shouldDrain(50, true), true);
-  assert.equal(shouldDrain(59, true), true);
-  assert.equal(shouldDrain(70, true), false);
-  assert.equal(shouldDrain(110, true), true);
-  assert.equal(shouldDrain(10, false), true);
-  assert.equal(shouldDrain(49, false), true);
+test('shouldDrain: only in the drain window (minute 50+) AND with nothing queued', () => {
+  // mid-hour: never drain — the idle runner listening is the reuse mechanism
+  assert.equal(shouldDrain(10, false), false);
+  assert.equal(shouldDrain(49, false), false);
+  assert.equal(shouldDrain(70, false), false);
+  // drain window without queued jobs: drain
   assert.equal(shouldDrain(50, false), true);
+  assert.equal(shouldDrain(59, false), true);
+  assert.equal(shouldDrain(110, false), true);
+  // queued jobs: keep serving, even in the window
+  assert.equal(shouldDrain(50, true), false);
+  assert.equal(shouldDrain(59, true), false);
+  assert.equal(shouldDrain(10, true), false);
 });

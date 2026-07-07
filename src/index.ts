@@ -327,44 +327,41 @@ async function handleNextRunner(req: http.IncomingMessage, res: http.ServerRespo
       }
 
       if (shouldDrain(aliveMinutes, hasQueuedJobs)) {
-        log('info', 'VM in drain window or no queued jobs, signaling exit', { vmName, aliveMinutes });
+        log('info', 'VM in drain window with nothing queued, signaling exit', { vmName, aliveMinutes });
         res.writeHead(204);
         res.end();
         return;
       }
 
-      // Find a queued job and generate fresh jitconfig.
+      // Not draining: always hand out a fresh jitconfig so the VM keeps an
+      // idle runner listening — that idle registration is what lets GitHub
+      // assign the next push instantly instead of booting a new VM. Prefer
+      // the repo with a queued job; otherwise register on the first repo.
+      // ponytail: with multiple allowlisted repos an idle runner only serves
+      // one of them — revisit with per-repo pools if that ever matters.
+      let targetRepo = [...config.repos][0]!;
       for (const repo of config.repos) {
         const jobs = await listQueuedJobs(config, repo);
-        const job = jobs.find((j) => labelsMatch(j.labels, config.runnerLabels));
-        if (job) {
-          const counter = (runnerCounters.get(vmName) ?? 0) + 1;
-          runnerCounters.set(vmName, counter);
-          const runnerName = `${vmName}-r${counter}`;
-
-          try {
-            const jitConfig = await generateJitConfig(config, repo, runnerName);
-            res.writeHead(200, { 'content-type': 'application/json' });
-            res.end(JSON.stringify({ jitconfig: jitConfig }));
-            log('info', 'issued fresh jitconfig for next job', {
-              vmName,
-              runnerName,
-              jobId: job.id,
-              repo,
-            });
-            return;
-          } catch (err) {
-            log('error', 'failed to generate jitconfig', { vmName, repo, error: String(err) });
-            res.writeHead(500);
-            res.end();
-            return;
-          }
+        if (jobs.some((j) => labelsMatch(j.labels, config.runnerLabels))) {
+          targetRepo = repo;
+          break;
         }
       }
 
-      // No queued jobs found.
-      res.writeHead(204);
-      res.end();
+      const counter = (runnerCounters.get(vmName) ?? 0) + 1;
+      runnerCounters.set(vmName, counter);
+      const runnerName = `${vmName}-r${counter}`;
+
+      try {
+        const jitConfig = await generateJitConfig(config, targetRepo, runnerName);
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ jitconfig: jitConfig }));
+        log('info', 'issued fresh jitconfig', { vmName, runnerName, repo: targetRepo, hasQueuedJobs });
+      } catch (err) {
+        log('error', 'failed to generate jitconfig', { vmName, repo: targetRepo, error: String(err) });
+        res.writeHead(500);
+        res.end();
+      }
     } catch (err) {
       log('error', 'next-runner handler error', { error: String(err) });
       res.writeHead(500);
