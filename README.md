@@ -61,6 +61,10 @@ Security: VM agent uses a per-VM token (HMAC of vmName + webhook secret) to auth
   never came online (dead networking). The pool tick detects and replaces it automatically,
   and reconcile provisions a fresh VM for still-queued jobs.
 
+- **8 GB swap for memory-heavy builds.** On small VMs (cx33: 8 GB RAM), memory-intensive
+  builds (e.g., full turbo Next.js builds) can exceed physical RAM. Cloud-init allocates
+  8 GB swap to prevent OOM kills, allowing builds to spill to disk safely.
+
 - **Zero runtime dependencies.** Plain Node 22 (`node:http`, `node:crypto`, `fetch`).
   The production image contains only the compiled `dist/`.
 

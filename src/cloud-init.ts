@@ -95,6 +95,7 @@ write_files:
     content: |
 ${agentLoop.split('\n').map((line) => '      ' + line).join('\n')}
 runcmd:
+  - fallocate -l 8G /swapfile && chmod 600 /swapfile && mkswap /swapfile && swapon /swapfile
   - mkdir -p /home/runner/actions-runner
   - curl -fsSL https://github.com/actions/runner/releases/download/v${runnerVersion}/actions-runner-linux-x64-${runnerVersion}.tar.gz | tar xz -C /home/runner/actions-runner
   - /home/runner/actions-runner/bin/installdependencies.sh
