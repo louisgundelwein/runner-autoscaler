@@ -110,7 +110,7 @@ All configuration is via environment variables — see [.env.example](.env.examp
 | `GITHUB_TOKEN` | ✔ | — | Fine-grained PAT (Administration RW + Actions R) |
 | `GITHUB_REPOS` | ✔ | — | Comma-separated `owner/repo` allowlist |
 | `HCLOUD_TOKEN` | ✔ | — | Hetzner Cloud API token |
-| `HETZNER_SERVER_TYPE` | | `cx32` | VM type for runners |
+| `HETZNER_SERVER_TYPE` | | `cx33` | VM type for runners |
 | `HETZNER_IMAGE` | | `ubuntu-24.04` | VM image |
 | `HETZNER_LOCATION` | | `nbg1` | Hetzner location |
 | `HETZNER_SSH_KEY` | | — | Optional SSH key (name or ID) for debugging VMs |

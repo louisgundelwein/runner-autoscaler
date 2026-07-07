@@ -37,7 +37,7 @@ export function loadConfig() {
     githubToken: required('GITHUB_TOKEN'),
     repos: parseRepos(required('GITHUB_REPOS')),
     hcloudToken: required('HCLOUD_TOKEN'),
-    serverType: process.env.HETZNER_SERVER_TYPE || 'cx32',
+    serverType: process.env.HETZNER_SERVER_TYPE || 'cx33',
     image: process.env.HETZNER_IMAGE || 'ubuntu-24.04',
     location: process.env.HETZNER_LOCATION || 'nbg1',
     sshKey: process.env.HETZNER_SSH_KEY || undefined,
