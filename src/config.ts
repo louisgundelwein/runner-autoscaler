@@ -15,6 +15,10 @@ function integer(name: string, fallback: number): number {
   return n;
 }
 
+function stripTrailingSlash(url: string): string {
+  return url.replace(/\/$/, '');
+}
+
 export function parseRepos(raw: string): Set<string> {
   const repos = new Set(
     raw
@@ -37,6 +41,7 @@ export function loadConfig() {
     githubToken: required('GITHUB_TOKEN'),
     repos: parseRepos(required('GITHUB_REPOS')),
     hcloudToken: required('HCLOUD_TOKEN'),
+    publicUrl: stripTrailingSlash(required('PUBLIC_URL')),
     serverType: process.env.HETZNER_SERVER_TYPE || 'cx33',
     image: process.env.HETZNER_IMAGE || 'ubuntu-24.04',
     location: process.env.HETZNER_LOCATION || 'nbg1',
@@ -46,8 +51,8 @@ export function loadConfig() {
       .map((l) => l.trim())
       .filter(Boolean),
     maxRunners: integer('MAX_RUNNERS', 3),
-    maxRunnerLifetimeMinutes: integer('MAX_RUNNER_LIFETIME_MINUTES', 120),
-    cleanupIntervalMinutes: integer('CLEANUP_INTERVAL_MINUTES', 15),
+    maxRunnerLifetimeMinutes: integer('MAX_RUNNER_LIFETIME_MINUTES', 360),
+    cleanupIntervalMinutes: integer('CLEANUP_INTERVAL_MINUTES', 2),
     port: integer('PORT', 8080),
   };
 }

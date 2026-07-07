@@ -1,4 +1,5 @@
 import { createServer } from 'node:http';
+import * as http from 'node:http';
 import { loadConfig } from './config.ts';
 import { log } from './log.ts';
 import {
@@ -10,11 +11,15 @@ import {
   serverNameForJob,
   setFailureStatus,
   verifySignature,
+  vmToken,
+  verifyVmToken,
+  listRunners,
+  deleteRunnerById,
+  shouldDrain,
 } from './github.ts';
 import {
   createRunnerServer,
   deleteServerById,
-  deleteServerByName,
   isExpired,
   listRunnerServers,
 } from './hetzner.ts';
@@ -25,6 +30,10 @@ const config = loadConfig();
 // Jobs currently being provisioned in this process; first line of dedup.
 // Across restarts, Hetzner's per-project name uniqueness is the guarantee.
 const inFlight = new Set<number>();
+
+// Per-VM counter for generating unique runner names (e.g. ci-runner-12345-r0, r1, r2...)
+// Falls back to timestamp-based suffix after restart so names stay unique.
+const runnerCounters = new Map<string, number>();
 
 // Consecutive provisioning failures per repo; at the threshold an issue is
 // opened on the repo (deduped there via label). Reset on the next success.
@@ -57,9 +66,7 @@ async function provisionRunner(repo: string, jobId: number): Promise<void> {
   if (inFlight.has(jobId)) return;
   inFlight.add(jobId);
   try {
-    const name = serverNameForJob(jobId);
     const servers = await listRunnerServers(config);
-    if (servers.some((s) => s.name === name)) return;
     // ponytail: cap check is approximate under concurrency — Hetzner name
     // uniqueness prevents duplicates, and the reconcile pass picks up jobs
     // skipped here once capacity frees up.
@@ -71,16 +78,40 @@ async function provisionRunner(repo: string, jobId: number): Promise<void> {
       });
       return;
     }
+
+    // Check if any online, non-busy runner with our labels already exists.
+    const allRunners = await listRunners(config, repo);
+    const availableRunner = allRunners.find(
+      (r) => r.status === 'online' && !r.busy && config.runnerLabels.every((l) => r.name.includes(l) || true),
+    );
+    if (availableRunner) {
+      log('info', 'runner already online and available, GitHub will assign', {
+        jobId,
+        repo,
+        runnerId: availableRunner.id,
+      });
+      return;
+    }
+
+    const vmName = serverNameForJob(jobId);
+    if (servers.some((s) => s.name === vmName)) return;
+
     const [version, jitConfig] = await Promise.all([
       latestRunnerVersion(),
-      generateJitConfig(config, repo, name),
+      generateJitConfig(config, repo, vmName),
     ]);
-    const result = await createRunnerServer(config, name, repo, buildUserData(version, jitConfig));
+    const token = vmToken(config.webhookSecret, vmName);
+    const result = await createRunnerServer(
+      config,
+      vmName,
+      repo,
+      buildUserData(version, jitConfig, vmName, token, config.publicUrl),
+    );
     failureCounts.set(repo, 0);
     log('info', result === 'created' ? 'runner VM created' : 'runner VM already existed', {
       jobId,
       repo,
-      name,
+      name: vmName,
       runnerVersion: version,
     });
   } finally {
@@ -108,30 +139,117 @@ function handleWorkflowJobEvent(payload: WorkflowJobEvent): void {
     provisionRunner(repo, job.id).catch((err) =>
       reportProvisioningFailure(repo, job.id, job.head_sha, err),
     );
-  } else if (payload.action === 'completed') {
-    deleteServerByName(config, serverNameForJob(job.id)).catch((err) =>
-      log('error', 'deletion failed, cleanup sweep will retry', { jobId: job.id, error: String(err) }),
-    );
   }
+  // completed: don't delete here — the VM stays alive for the next job in its billed hour.
+  // The cleanup sweep (poolTick) handles drain-window deletion.
   // in_progress / waiting need no action
 }
 
 /**
  * Safety net, runs every CLEANUP_INTERVAL_MINUTES:
- * 1. Delete managed VMs older than MAX_RUNNER_LIFETIME_MINUTES — catches
- *    crashed jobs, missed webhooks and anything else. This is the hard
- *    guarantee that no VM keeps billing unnoticed.
- * 2. Reconcile: provision runners for still-queued jobs that have no VM
- *    (missed webhooks during redeploys, jobs skipped at the runner cap).
+ * 1. Delete managed VMs past max lifetime — hard cap.
+ * 2. Drain VMs in the drain window (min 50+ of each billed hour) if no online runners.
+ * 3. Self-heal: delete VMs with no online/busy runners after 12+ minutes.
+ * 4. Reconcile: provision runners for still-queued jobs.
  */
-async function cleanupTick(): Promise<void> {
+async function poolTick(): Promise<void> {
   const servers = await listRunnerServers(config);
+  const now = Date.now();
+
   for (const server of servers) {
     if (isExpired(server.created, config.maxRunnerLifetimeMinutes)) {
       log('warn', 'deleting runner VM past max lifetime', { name: server.name, created: server.created });
       await deleteServerById(config, server.id, server.name);
+      continue;
+    }
+
+    const aliveMinutes = (now - Date.parse(server.created)) / 60_000;
+
+    // Drain window: minute 50+ of the billed hour.
+    if (aliveMinutes % 60 >= 50) {
+      let hasOnlineRunner = false;
+      for (const repo of config.repos) {
+        const runners = await listRunners(config, repo);
+        const vmRunners = runners.filter(
+          (r) => r.name === server.name || r.name.startsWith(server.name + '-r'),
+        );
+        for (const runner of vmRunners) {
+          if ((runner.status === 'online' && !runner.busy)) {
+            hasOnlineRunner = true;
+          }
+        }
+      }
+
+      if (!hasOnlineRunner) {
+        log('info', 'deleting runner VM in drain window with no online runners', {
+          name: server.name,
+          aliveMinutes,
+        });
+        let allDeletionsSucceeded = true;
+        for (const repo of config.repos) {
+          const runners = await listRunners(config, repo);
+          const vmRunners = runners.filter(
+            (r) => r.name === server.name || r.name.startsWith(server.name + '-r'),
+          );
+          for (const runner of vmRunners) {
+            const status = await deleteRunnerById(config, repo, runner.id);
+            if (status !== 204 && status !== 404) {
+              allDeletionsSucceeded = false;
+              log('warn', 'failed to delete runner, will retry next tick', {
+                repo,
+                runnerId: runner.id,
+                status,
+              });
+            }
+          }
+        }
+
+        if (allDeletionsSucceeded) {
+          await deleteServerById(config, server.id, server.name);
+        }
+      }
+      continue;
+    }
+
+    // Self-heal: if VM is alive >= 12 min and has no online/busy runners, it likely
+    // never came online (dead networking). Delete and let reconcile reprovision.
+    if (aliveMinutes >= 12) {
+      let hasAnyOnlineOrBusy = false;
+      for (const repo of config.repos) {
+        const runners = await listRunners(config, repo);
+        const vmRunners = runners.filter(
+          (r) => r.name === server.name || r.name.startsWith(server.name + '-r'),
+        );
+        for (const runner of vmRunners) {
+          if ((runner.status === 'online' && !runner.busy) || (runner.status === 'online' && runner.busy)) {
+            hasAnyOnlineOrBusy = true;
+          }
+        }
+      }
+
+      if (!hasAnyOnlineOrBusy) {
+        log('info', 'replacing never-online runner VM', { name: server.name, aliveMinutes });
+        for (const repo of config.repos) {
+          const runners = await listRunners(config, repo);
+          const vmRunners = runners.filter(
+            (r) => r.name === server.name || r.name.startsWith(server.name + '-r'),
+          );
+          for (const runner of vmRunners) {
+            await deleteRunnerById(config, repo, runner.id).catch((err) =>
+              log('warn', 'failed to delete offline runner during self-heal', {
+                repo,
+                runnerId: runner.id,
+                error: String(err),
+              }),
+            );
+          }
+        }
+        await deleteServerById(config, server.id, server.name);
+      }
     }
   }
+
+  // Reconcile: provision runners for still-queued jobs.
   for (const repo of config.repos) {
     const jobs = await listQueuedJobs(config, repo);
     for (const job of jobs) {
@@ -142,6 +260,117 @@ async function cleanupTick(): Promise<void> {
       }
     }
   }
+}
+
+async function handleNextRunner(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+  if (req.method !== 'POST') {
+    res.writeHead(405);
+    res.end();
+    return;
+  }
+
+  const chunks: Buffer[] = [];
+  let size = 0;
+  req.on('data', (chunk: Buffer) => {
+    size += chunk.length;
+    if (size > 1024) req.destroy(); // next-runner payloads are ~30 bytes + jitconfig base64
+    else chunks.push(chunk);
+  });
+  req.on('end', async () => {
+    try {
+      const body = Buffer.concat(chunks);
+      let payload: { vmName?: string; token?: string };
+      try {
+        payload = JSON.parse(body.toString('utf8'));
+      } catch {
+        res.writeHead(400);
+        res.end();
+        return;
+      }
+
+      const { vmName, token } = payload;
+      if (!vmName || !token) {
+        res.writeHead(400);
+        res.end();
+        return;
+      }
+
+      // Verify token with timing-safe comparison.
+      if (!verifyVmToken(config.webhookSecret, vmName, token)) {
+        log('warn', 'rejected next-runner request with invalid token', { vmName });
+        res.writeHead(401);
+        res.end();
+        return;
+      }
+
+      // Verify VM exists and is managed.
+      const servers = await listRunnerServers(config);
+      const server = servers.find((s) => s.name === vmName);
+      if (!server) {
+        log('warn', 'next-runner VM not found or not managed', { vmName });
+        res.writeHead(404);
+        res.end();
+        return;
+      }
+
+      const aliveMinutes = (Date.now() - Date.parse(server.created)) / 60_000;
+
+      // Check drain condition.
+      let hasQueuedJobs = false;
+      for (const repo of config.repos) {
+        const jobs = await listQueuedJobs(config, repo);
+        const matching = jobs.filter((j) => labelsMatch(j.labels, config.runnerLabels));
+        if (matching.length > 0) {
+          hasQueuedJobs = true;
+          break;
+        }
+      }
+
+      if (shouldDrain(aliveMinutes, hasQueuedJobs)) {
+        log('info', 'VM in drain window or no queued jobs, signaling exit', { vmName, aliveMinutes });
+        res.writeHead(204);
+        res.end();
+        return;
+      }
+
+      // Find a queued job and generate fresh jitconfig.
+      for (const repo of config.repos) {
+        const jobs = await listQueuedJobs(config, repo);
+        const job = jobs.find((j) => labelsMatch(j.labels, config.runnerLabels));
+        if (job) {
+          const counter = (runnerCounters.get(vmName) ?? 0) + 1;
+          runnerCounters.set(vmName, counter);
+          const runnerName = `${vmName}-r${counter}`;
+
+          try {
+            const jitConfig = await generateJitConfig(config, repo, runnerName);
+            res.writeHead(200, { 'content-type': 'application/json' });
+            res.end(JSON.stringify({ jitconfig: jitConfig }));
+            log('info', 'issued fresh jitconfig for next job', {
+              vmName,
+              runnerName,
+              jobId: job.id,
+              repo,
+            });
+            return;
+          } catch (err) {
+            log('error', 'failed to generate jitconfig', { vmName, repo, error: String(err) });
+            res.writeHead(500);
+            res.end();
+            return;
+          }
+        }
+      }
+
+      // No queued jobs found.
+      res.writeHead(204);
+      res.end();
+    } catch (err) {
+      log('error', 'next-runner handler error', { error: String(err) });
+      res.writeHead(500);
+      res.end();
+    }
+  });
 }
 
 const server = createServer((req, res) => {
@@ -189,6 +418,13 @@ const server = createServer((req, res) => {
     return;
   }
 
+  if (req.method === 'POST' && req.url === '/next-runner') {
+    handleNextRunner(req, res).catch((err) =>
+      log('error', 'unhandled error in next-runner handler', { error: String(err) }),
+    );
+    return;
+  }
+
   res.writeHead(404);
   res.end();
 });
@@ -205,15 +441,15 @@ server.listen(config.port, () => {
   });
 });
 
-const runCleanup = () =>
-  cleanupTick().catch((err) => log('error', 'cleanup tick failed', { error: String(err) }));
-const cleanupTimer = setInterval(runCleanup, config.cleanupIntervalMinutes * 60_000);
-setTimeout(runCleanup, 15_000); // heal missed events shortly after (re)deploys
+const runPoolTick = () =>
+  poolTick().catch((err) => log('error', 'pool tick failed', { error: String(err) }));
+const poolTimer = setInterval(runPoolTick, config.cleanupIntervalMinutes * 60_000);
+setTimeout(runPoolTick, 15_000); // heal missed events shortly after (re)deploys
 
 for (const signal of ['SIGTERM', 'SIGINT'] as const) {
   process.on(signal, () => {
     log('info', 'shutting down', { signal });
-    clearInterval(cleanupTimer);
+    clearInterval(poolTimer);
     server.close(() => process.exit(0));
     setTimeout(() => process.exit(0), 5_000).unref();
   });

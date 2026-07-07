@@ -12,6 +12,18 @@ export function verifySignature(secret: string, body: Buffer, signatureHeader: s
   return timingSafeEqual(Buffer.from(received), Buffer.from(expected));
 }
 
+/** Compute the token for a VM (HMAC-SHA256 of vmName keyed with the webhook secret). */
+export function vmToken(webhookSecret: string, vmName: string): string {
+  return createHmac('sha256', webhookSecret).update(vmName).digest('hex');
+}
+
+/** Verify a VM token with timing-safe comparison. */
+export function verifyVmToken(webhookSecret: string, vmName: string, token: string): boolean {
+  const expected = vmToken(webhookSecret, vmName);
+  if (token.length !== expected.length) return false;
+  return timingSafeEqual(Buffer.from(token), Buffer.from(expected));
+}
+
 /**
  * A job is ours when every label it requests is one of our runner labels
  * (GitHub assigns a job to a runner iff the job's runs-on labels are a
@@ -164,6 +176,12 @@ export async function latestRunnerVersion(): Promise<string> {
 }
 
 export type QueuedJob = { id: number; labels: string[]; head_sha: string };
+export type Runner = { id: number; name: string; status: string; busy: boolean };
+
+/** Check if a VM should drain (no longer accept new jobs). */
+export function shouldDrain(aliveMinutes: number, hasQueuedJobs: boolean): boolean {
+  return aliveMinutes % 60 >= 50 || !hasQueuedJobs;
+}
 
 /**
  * List queued workflow jobs for a repo. Used by the reconcile pass to heal
@@ -190,4 +208,28 @@ export async function listQueuedJobs(config: Config, repo: string): Promise<Queu
     }
   }
   return jobs;
+}
+
+/** List all runners for a repo. */
+export async function listRunners(config: Config, repo: string): Promise<Runner[]> {
+  const runners = (await githubRequest(
+    config.githubToken,
+    'GET',
+    `/repos/${repo}/actions/runners?per_page=100`,
+  )) as { runners: Array<{ id: number; name: string; status: string; busy: boolean }> };
+  return runners.runners.map((r) => ({ id: r.id, name: r.name, status: r.status, busy: r.busy }));
+}
+
+/** Delete a runner by ID. Returns the HTTP status (204 expected; 404 treated as success). */
+export async function deleteRunnerById(config: Config, repo: string, runnerId: number): Promise<number> {
+  const res = await fetch(`${API}/repos/${repo}/actions/runners/${runnerId}`, {
+    method: 'DELETE',
+    headers: {
+      authorization: `Bearer ${config.githubToken}`,
+      accept: 'application/vnd.github+json',
+      'x-github-api-version': '2022-11-28',
+      'user-agent': 'runner-autoscaler',
+    },
+  });
+  return res.status;
 }

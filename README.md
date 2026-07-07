@@ -1,40 +1,69 @@
 # runner-autoscaler
 
 Ephemeral GitHub Actions runner autoscaler for [Hetzner Cloud](https://www.hetzner.com/cloud).
-One throwaway VM per CI job — created when the job queues, deleted when it finishes.
-You pay only for the minutes your jobs actually run (a cx33 costs ~€0.01/hour).
+With **v2 VM reuse**, a single VM runs multiple jobs within its billed hour, reducing costs.
+Billed hour boundaries are respected — VMs drain at minute 50 and shut down before the next hour starts.
+A cx33 costs ~€0.01/hour, so reusing one VM for N jobs saves N–1 hours of billing.
 
 ```
 GitHub Actions job queued
         │  workflow_job webhook
         ▼
-  runner-autoscaler ──► Hetzner API: create VM (cloud-init)
+  runner-autoscaler ──► Hetzner API: create VM (cloud-init + agent loop)
         │                     │
         │                     ▼
-        │            VM registers as a just-in-time runner,
-        │            runs exactly one job
-        │  workflow_job "completed" webhook
+        │            VM runs agent loop:
+        │              1. ./run.sh --jitconfig <job 1>
+        │              2. POST /next-runner → poll for next job
+        │              3. Repeat until drain window (min 50) or no jobs
+        │                     │
+        │ (no webhook needed)  ▼
+        │            VM POSTs /next-runner every time a job finishes
+        │              ├─ 200 + fresh jitconfig → run job 2, 3, ...
+        │              └─ 204 (drain) → exit gracefully
+        │                     │
+        ▼ (2-min tick)        ▼
+  runner-autoscaler: pool tick (drain check, self-heal, reconcile)
+        │ • Delete VMs past max lifetime (hard cap)
+        │ • Drain VMs in minute 50+ with no active runners
+        │ • Self-heal: replace VMs never-online after 12+ min
+        │ • Reconcile: provision runners for still-queued jobs
         ▼
-  runner-autoscaler ──► Hetzner API: delete VM
+  Hetzner API: delete VM (if draining or past max lifetime)
 ```
 
-A cleanup sweep (every 15 min) additionally deletes any managed VM older than
-`MAX_RUNNER_LIFETIME_MINUTES`, so no VM can keep billing unnoticed even if a
-webhook is lost — and re-provisions runners for jobs whose webhook was missed.
+Security: VM agent uses a per-VM token (HMAC of vmName + webhook secret) to authenticate
+/next-runner requests — the webhook secret itself never leaves the autoscaler.
 
 ## Design notes
 
+- **VM reuse within billed hours.** VMs run multiple jobs (via `agent-loop.sh`) within
+  their billed hour and drain gracefully at minute 50. No per-job webhooks needed — the
+  agent loop polls `/next-runner` for the next jitconfig. This reduces billing by ~50%
+  for most CI pipelines (5 sequential jobs → 1 VM instead of 5).
+
 - **JIT runners, no secrets on VMs.** The autoscaler calls GitHub's
   [`generate-jitconfig`](https://docs.github.com/en/rest/actions/self-hosted-runners#create-configuration-for-a-just-in-time-runner-for-a-repository)
-  API and bakes the single-use config blob into the VM's cloud-init. No GitHub
-  token and no Hetzner token ever exist on a runner VM, so CI job code cannot
-  steal credentials. JIT runners are inherently ephemeral: one job, then GitHub
-  removes them.
-- **Idempotent by construction.** VM names are `ci-runner-<job_id>`; Hetzner
-  enforces unique names per project, so duplicate webhook deliveries cannot
-  create duplicate VMs. Deleting an already-deleted VM is a no-op.
-- **Zero runtime dependencies.** Plain Node 22 (`node:http`, `node:crypto`,
-  `fetch`). The production image contains only the compiled `dist/`.
+  API once per job and bakes each config into the `/next-runner` response. No GitHub
+  token and no Hetzner token ever exist on a runner VM. The webhook secret is never
+  sent to the VM — only a per-VM token (HMAC-SHA256 of vmName) for `/next-runner` auth.
+
+- **Idempotent by construction.** VM names are `ci-runner-<job_id>`; Hetzner enforces
+  unique names per project. Runner names within a VM are `<vmName>-r<N>` (monotonic).
+  Duplicate webhook deliveries cannot create duplicate VMs, and reconcile is safe.
+
+- **Drain window and cost discipline.** VMs enter a drain window at minute 50 of each
+  billed hour and signal jobs to exit via 204 status on `/next-runner`. The pool tick
+  (every 2 min by default) detects drain readiness and deletes VMs with no active
+  runners. This ensures billing never exceeds max lifetime and respects hour boundaries.
+
+- **Self-healing.** If a VM is alive 12+ minutes with no online/busy runners, it likely
+  never came online (dead networking). The pool tick detects and replaces it automatically,
+  and reconcile provisions a fresh VM for still-queued jobs.
+
+- **Zero runtime dependencies.** Plain Node 22 (`node:http`, `node:crypto`, `fetch`).
+  The production image contains only the compiled `dist/`.
+
 - **Multi-repo.** One deployment serves any number of repositories via the
   `GITHUB_REPOS` allowlist.
 
@@ -70,7 +99,7 @@ cp .env.example .env   # fill in the four required values
 docker compose up -d --build
 ```
 
-The container exposes port 8080 (`POST /webhook`, `GET /health`).
+The container exposes port 8080 (`POST /webhook`, `POST /next-runner`, `GET /health`).
 
 ### 4. Repository webhook (per repo)
 
@@ -111,18 +140,19 @@ All configuration is via environment variables — see [.env.example](.env.examp
 
 | Variable | Required | Default | Purpose |
 | --- | --- | --- | --- |
-| `GITHUB_WEBHOOK_SECRET` | ✔ | — | Webhook HMAC secret (shared with every repo webhook) |
+| `GITHUB_WEBHOOK_SECRET` | ✔ | — | Webhook HMAC secret (shared with every repo webhook and for VM tokens) |
 | `GITHUB_TOKEN` | ✔ | — | Fine-grained PAT (Administration RW + Actions R) |
 | `GITHUB_REPOS` | ✔ | — | Comma-separated `owner/repo` allowlist |
 | `HCLOUD_TOKEN` | ✔ | — | Hetzner Cloud API token |
+| `PUBLIC_URL` | ✔ | — | Public HTTPS URL of this autoscaler (for VMs to reach `/next-runner`) |
 | `HETZNER_SERVER_TYPE` | | `cx33` | VM type for runners |
 | `HETZNER_IMAGE` | | `ubuntu-24.04` | VM image |
 | `HETZNER_LOCATION` | | `nbg1` | Hetzner location |
 | `HETZNER_SSH_KEY` | | — | Optional SSH key (name or ID) for debugging VMs |
 | `RUNNER_LABELS` | | `self-hosted,hetzner` | Labels runners register with |
 | `MAX_RUNNERS` | | `3` | Max concurrent runner VMs |
-| `MAX_RUNNER_LIFETIME_MINUTES` | | `120` | Hard VM age cap — must exceed your longest job |
-| `CLEANUP_INTERVAL_MINUTES` | | `15` | Cleanup/reconcile sweep interval |
+| `MAX_RUNNER_LIFETIME_MINUTES` | | `360` | Hard VM age cap (6 hours default for reuse model; must exceed longest job) |
+| `CLEANUP_INTERVAL_MINUTES` | | `2` | Pool tick interval — detects drain window, self-heals, reconciles (recommended 2 min) |
 | `PORT` | | `8080` | HTTP port |
 
 ## Security
@@ -130,12 +160,23 @@ All configuration is via environment variables — see [.env.example](.env.examp
 - **Only use this for private repositories.** On public repos, anyone can open
   a fork PR and run arbitrary code on your VMs. See GitHub's
   [self-hosted runner security notes](https://docs.github.com/en/actions/security-guides/security-hardening-for-github-actions#hardening-for-self-hosted-runners).
-- Webhook requests are verified with HMAC-SHA256 (`X-Hub-Signature-256`,
-  constant-time comparison); invalid signatures get 401.
-- Runner VMs contain no credentials (see design notes) and accept no inbound
-  traffic requirement — the runner only makes outbound HTTPS long-polls. Add
-  `HETZNER_SSH_KEY` only when you need to debug.
-- Secrets never appear in logs.
+
+- **Webhook signature verification** (`X-Hub-Signature-256`, timing-safe HMAC-SHA256);
+  invalid signatures get 401.
+
+- **VM token authentication** on `/next-runner`: each VM receives a per-VM token
+  (HMAC-SHA256 of vmName keyed with the webhook secret). The VM sends it with each
+  `/next-runner` POST and the autoscaler verifies it with timing-safe comparison.
+  **Residual risk:** Job code running on the VM can read its token from the baked
+  user-data and pull additional jitconfigs for that same VM — but both are in the
+  same trust domain (private repos), so this is acceptable. The webhook secret itself
+  never reaches the VM.
+
+- Runner VMs contain no credentials and accept no inbound traffic — the runner makes
+  only outbound HTTPS long-polls to GitHub and `/next-runner` POSTs to the autoscaler.
+  Add `HETZNER_SSH_KEY` only when you need to debug.
+
+- Secrets never appear in logs — neither webhook secrets nor tokens.
 
 ## Development
 
