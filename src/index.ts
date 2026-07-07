@@ -177,23 +177,22 @@ async function poolTick(): Promise<void> {
 
     const aliveMinutes = (now - Date.parse(server.created)) / 60_000;
 
-    // Drain window: minute 50+ of the billed hour.
+    // Drain window: minute 50+ of the billed hour. A healthy reused VM sits
+    // here with an idle ONLINE runner listening — that is exactly what we
+    // deregister (GitHub stops assigning after the DELETE) and then remove
+    // the VM. Only a BUSY runner (job in flight) defers to the next tick.
     if (aliveMinutes % 60 >= 50) {
-      let hasOnlineRunner = false;
+      let hasBusyRunner = false;
       for (const repo of config.repos) {
         const runners = await listRunners(config, repo);
         const vmRunners = runners.filter(
           (r) => r.name === server.name || r.name.startsWith(server.name + '-r'),
         );
-        for (const runner of vmRunners) {
-          if ((runner.status === 'online' && !runner.busy)) {
-            hasOnlineRunner = true;
-          }
-        }
+        if (vmRunners.some((r) => r.busy)) hasBusyRunner = true;
       }
 
-      if (!hasOnlineRunner) {
-        log('info', 'deleting runner VM in drain window with no online runners', {
+      if (!hasBusyRunner) {
+        log('info', 'draining runner VM at hour boundary', {
           name: server.name,
           aliveMinutes,
         });
