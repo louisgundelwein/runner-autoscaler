@@ -2,7 +2,7 @@
 
 Ephemeral GitHub Actions runner autoscaler for [Hetzner Cloud](https://www.hetzner.com/cloud).
 One throwaway VM per CI job — created when the job queues, deleted when it finishes.
-You pay only for the minutes your jobs actually run (a cx32 costs ~€0.01/hour).
+You pay only for the minutes your jobs actually run (a cx33 costs ~€0.01/hour).
 
 ```
 GitHub Actions job queued
@@ -91,7 +91,7 @@ jobs:
       - run: echo "running on an ephemeral Hetzner VM"
 ```
 
-First run: expect ~60–90 s of queue time while the VM boots and the runner
+First run: expect ~2–5 min of queue time (VM boot, apt + runner install) while the VM boots and the runner
 installs, then the job starts.
 
 ### Adding another repository later
@@ -147,7 +147,7 @@ npm run dev       # run locally with .env
   Settings → Webhooks → Recent Deliveries): 401 means wrong secret, timeout
   means the service is down. The reconcile sweep provisions missed jobs within
   `CLEANUP_INTERVAL_MINUTES` on its own.
-- **Job stays queued, VM exists** — boot/install takes ~60–90 s. If it never
+- **Job stays queued, VM exists** — boot/install takes ~2–5 min. If it never
   starts, create the VM with `HETZNER_SSH_KEY` set and inspect
   `/var/log/cloud-init-output.log` on the VM.
 - **VM survives a job** — the cleanup sweep removes it after
